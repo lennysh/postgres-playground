@@ -1,4 +1,4 @@
-# Table bloat & vacuum diagnostics
+# AAP table bloat & vacuum diagnostics
 
 Ansible playbook that runs the same PostgreSQL inspection queries you would use in `psql`,
 then writes a markdown report with interpretation and next steps.
@@ -22,7 +22,7 @@ is why a manual `psql` session can show **0 rows** even when index bloat is the 
 ## Quick start
 
 ```bash
-cd demos/table-bloat-diag
+cd demos/aap-table-bloat-diag
 ansible-galaxy collection install -r collections/requirements.yml
 pip install -r requirements.txt   # psycopg2 for ansible-playbook's Python
 cp vars/pg_connect.example.yml vars/pg_connect.yml   # edit host, user, password, db, table
@@ -77,7 +77,7 @@ vendor guidance; start with plain `VACUUM (ANALYZE)` and reindex if needed.
 ## Files
 
 ```text
-demos/table-bloat-diag/
+demos/aap-table-bloat-diag/
 ├── playbook.yml
 ├── ansible.cfg
 ├── collections/requirements.yml
