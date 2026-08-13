@@ -1,0 +1,23 @@
+---
+# Copy to vars/pg_connect.yml and customize, or pass with -e @vars/pg_connect.yml
+#
+# Connection (module params map 1:1 to libpq / psql):
+pg_login_host: localhost
+pg_login_port: 5432
+pg_login_user: postgres
+pg_login_password: CHANGE_ME
+# AAP controller DB where main_host lives (often awx; legacy installs may use ansibleauto).
+pg_login_db: awx
+pg_ssl_mode: prefer
+
+# Table to inspect (matches the relname filter in the SQL below).
+pg_target_table: main_host
+
+# Report output on the control node.
+pg_report_path: "{{ playbook_dir }}/table-bloat-report.md"
+pg_report_display: true
+
+# Analysis thresholds (dead_tuple_ratio_pct from pg_stat_user_tables).
+pg_dead_tuple_warn_pct: 20
+pg_dead_tuple_critical_pct: 50
+pg_index_dominance_warn_pct: 80

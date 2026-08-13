@@ -1,0 +1,2 @@
+# Control-node dependency for community.postgresql (not an Ansible collection).
+psycopg2-binary>=2.9

@@ -1,0 +1,121 @@
+# PostgreSQL table bloat diagnostic
+
+**Generated:** {{ ansible_date_time.iso8601 }}  
+**Target:** `{{ pg_login_db }}` @ `{{ pg_login_host }}:{{ pg_login_port | default(5432) }}`  
+**Table:** `{{ pg_target_table }}`
+
+## 1. Database size
+
+| Metric | Value |
+|--------|-------|
+| Database size | {{ pg_diag_db.database_size }} |
+| Database size (bytes) | {{ pg_diag_db.database_size_bytes | int }} |
+
+## 2. Table on-disk breakdown (`pg_class`)
+
+| table_name | total_size_on_disk | heap_table_size | index_and_toast_size |
+|------------|-------------------|-----------------|----------------------|
+| {{ pg_diag_table.table_name }} | {{ pg_diag_table.total_size_on_disk }} | {{ pg_diag_table.heap_table_size }} | {{ pg_diag_table.index_and_toast_size }} |
+
+| Metric | Bytes |
+|--------|------:|
+| Total on disk | {{ pg_diag_table.total_bytes | int }} |
+| Heap (main fork) | {{ pg_diag_table.heap_bytes | int }} |
+| Indexes + TOAST | {{ pg_diag_table.index_and_toast_bytes | int }} |
+
+{% set _total = pg_diag_table.total_bytes | int %}
+{% set _index_toast = pg_diag_table.index_and_toast_bytes | int %}
+{% set _index_pct = ((_index_toast / _total) * 100) | round(2) if _total > 0 else 0 %}
+
+**Index + TOAST share of table footprint:** {{ _index_pct }}%
+
+## 3. Live / dead tuples and vacuum history (`pg_stat_user_tables`)
+
+| schemaname | relname | live_rows | dead_rows | dead_tuple_ratio_pct | last_vacuum | last_autovacuum | last_analyze | last_autoanalyze |
+|------------|---------|----------:|----------:|---------------------:|-------------|-----------------|--------------|------------------|
+| {{ pg_diag_vacuum.schemaname }} | {{ pg_diag_vacuum.relname }} | {{ pg_diag_vacuum.live_rows }} | {{ pg_diag_vacuum.dead_rows }} | {{ pg_diag_vacuum.dead_tuple_ratio_pct }} | {{ pg_diag_vacuum.last_vacuum | default('') }} | {{ pg_diag_vacuum.last_autovacuum | default('') }} | {{ pg_diag_vacuum.last_analyze | default('') }} | {{ pg_diag_vacuum.last_autoanalyze | default('') }} |
+
+## 4. TOAST companion table (`pg_class` + stats)
+
+{% if pg_diag_toast_rows | length == 0 %}
+No TOAST stats row returned for `{{ pg_target_table }}`.
+
+The original query joined `pg_stat_user_tables`, which only lists user-schema tables. TOAST
+relations live under `pg_toast`, so that join often returns zero rows even when TOAST exists.
+This playbook uses `pg_stat_all_tables` instead so TOAST rows appear when present.
+{% else %}
+| main_table | toast_table | toast_table_size | toast_live_rows | toast_dead_rows | toast_last_autovacuum |
+|------------|-------------|------------------|----------------:|----------------:|-----------------------|
+{% for row in pg_diag_toast_rows %}
+| {{ row.main_table }} | {{ row.toast_table | default('') }} | {{ row.toast_table_size | default('0 bytes') }} | {{ row.toast_live_rows | default(0) }} | {{ row.toast_dead_rows | default(0) }} | {{ row.toast_last_autovacuum | default('') }} |
+{% endfor %}
+{% endif %}
+
+---
+
+## Analysis
+
+{% set _dead_pct = pg_diag_vacuum.dead_tuple_ratio_pct | float %}
+{% set _live = pg_diag_vacuum.live_rows | int %}
+{% set _dead = pg_diag_vacuum.dead_rows | int %}
+{% set _never_vacuumed = (pg_diag_vacuum.last_vacuum is none or pg_diag_vacuum.last_vacuum | string | length == 0) and (pg_diag_vacuum.last_autovacuum is none or pg_diag_vacuum.last_autovacuum | string | length == 0) %}
+
+### Summary
+
+{% if _dead_pct >= pg_dead_tuple_critical_pct | float %}
+- **CRITICAL — dead tuple ratio {{ _dead_pct }}%** (threshold {{ pg_dead_tuple_critical_pct }}%). The table is almost entirely dead row versions on disk.
+{% elif _dead_pct >= pg_dead_tuple_warn_pct | float %}
+- **WARNING — dead tuple ratio {{ _dead_pct }}%** (warn at {{ pg_dead_tuple_warn_pct }}%).
+{% else %}
+- Dead tuple ratio {{ _dead_pct }}% is within configured warn/critical thresholds.
+{% endif %}
+
+- Live rows: **{{ _live | int }}**; dead rows: **{{ _dead | int }}**.
+{% if _never_vacuumed %}
+- **No `VACUUM` or autovacuum** has completed for this table (`last_vacuum` and `last_autovacuum` are empty). Bloat will accumulate until vacuum runs.
+{% else %}
+- Last vacuum: {{ pg_diag_vacuum.last_vacuum | default(pg_diag_vacuum.last_autovacuum) }}.
+{% endif %}
+
+{% if _index_pct >= pg_index_dominance_warn_pct | float %}
+- **{{ _index_pct }}%** of `{{ pg_target_table }}` on-disk size is indexes and TOAST, not heap data (warn at {{ pg_index_dominance_warn_pct }}%). With a high dead-tuple ratio this usually means **index bloat** from never-vacuumed dead entries, not large row payloads.
+{% endif %}
+
+{% if pg_diag_toast_rows | length == 0 and _index_pct >= pg_index_dominance_warn_pct | float %}
+- TOAST stats are empty or negligible; the oversized footprint is **not** explained by external TOAST storage. Focus on **VACUUM** and possibly **REINDEX** on `{{ pg_target_table }}`.
+{% elif pg_diag_toast_rows | length > 0 %}
+{% set _toast = pg_diag_toast_rows[0] %}
+{% if (_toast.toast_table_bytes | default(0) | int) > (pg_diag_table.heap_bytes | int) %}
+- TOAST table `{{ _toast.toast_table }}` ({{ _toast.toast_table_size }}) is larger than the heap. Wide / large column values may be stored out-of-line; vacuum TOAST as well.
+{% endif %}
+{% endif %}
+
+### Likely root cause (pattern match)
+
+{% if _dead_pct >= pg_dead_tuple_critical_pct | float and _never_vacuumed and _index_pct >= pg_index_dominance_warn_pct | float %}
+Matches a classic **autovacuum starvation / never-vacuumed** pattern:
+
+1. Many updates or deletes left ~{{ _dead | int }} dead row versions for ~{{ _live | int }} live rows.
+2. Autovacuum has not reclaimed them, so indexes still point at dead tuples.
+3. `pg_total_relation_size` balloons (here mostly **indexes**, not heap), while `n_live_tup` stays small.
+
+This is consistent with an AAP `main_host` inventory table that has been heavily churned without maintenance.
+
+{% else %}
+Review the raw metrics above against workload (update/delete rate), autovacuum settings
+(`autovacuum_vacuum_scale_factor`, `autovacuum_vacuum_threshold`), and long transactions
+blocking vacuum.
+
+{% endif %}
+
+### Recommended next steps
+
+1. **During a maintenance window:** run `VACUUM (VERBOSE, ANALYZE) {{ pg_diag_vacuum.schemaname }}.{{ pg_target_table }};` and watch reclaimed space.
+2. If disk usage remains high after vacuum, plan **`REINDEX TABLE {{ pg_diag_vacuum.schemaname }}.{{ pg_target_table }};`** or `REINDEX CONCURRENTLY` per index (PostgreSQL version / edition permitting).
+3. Confirm autovacuum is enabled and not blocked (`pg_stat_activity`, `pg_locks`, long idle transactions).
+4. For AAP Controller DBs, coordinate with Red Hat guidance before `VACUUM FULL` or destructive operations on `main_host` and related inventory tables.
+5. Re-run this playbook after maintenance to verify dead tuple ratio and on-disk sizes dropped.
+
+---
+
+*Queries live in `files/queries/`; thresholds in `vars/pg_connect.example.yml`.*

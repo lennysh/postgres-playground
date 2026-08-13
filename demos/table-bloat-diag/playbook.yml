@@ -1,0 +1,183 @@
+---
+# PostgreSQL table bloat and vacuum diagnostics.
+#
+#   cp vars/pg_connect.example.yml vars/pg_connect.yml
+#   ansible-galaxy collection install -r collections/requirements.yml
+#   ansible-playbook playbook.yml -e @vars/pg_connect.yml
+#
+# Requires psycopg2 (or psycopg2-binary) on the control node for community.postgresql.
+
+- name: PostgreSQL table bloat and vacuum diagnostics
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars:
+    # Modules run on localhost — use ansible-playbook's Python (not auto-discovered
+    # /usr/bin/python3, which often lacks psycopg2).
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+    pg_query_named_args:
+      table_name: "{{ pg_target_table }}"
+  tasks:
+    - name: Map PG* environment variables when login vars are unset
+      when:
+        - pg_login_host is not defined or pg_login_host | length == 0
+        - lookup('env', 'PGHOST') | default('', true) | length > 0
+      ansible.builtin.set_fact:
+        pg_login_host: "{{ lookup('env', 'PGHOST') }}"
+        pg_login_port: "{{ lookup('env', 'PGPORT') | default(5432, true) | int }}"
+        pg_login_user: "{{ lookup('env', 'PGUSER') }}"
+        pg_login_password: "{{ lookup('env', 'PGPASSWORD') }}"
+        pg_login_db: "{{ lookup('env', 'PGDATABASE') }}"
+        pg_ssl_mode: "{{ lookup('env', 'PGSSLMODE') | default('prefer', true) }}"
+
+    - name: Require PostgreSQL connection settings
+      ansible.builtin.assert:
+        that:
+          - pg_login_host is defined
+          - pg_login_host | length > 0
+          - pg_login_user is defined
+          - pg_login_user | length > 0
+          - pg_login_db is defined
+          - pg_login_db | length > 0
+          - pg_target_table is defined
+          - pg_target_table | length > 0
+        fail_msg: >-
+          Set pg_login_host, pg_login_user, pg_login_db, and pg_target_table
+          (vars/pg_connect.yml or -e), or export PGHOST/PGUSER/PGDATABASE.
+
+    - name: Require psycopg2 on the control node
+      ansible.builtin.command:
+        cmd: "{{ ansible_python_interpreter }} -c 'import psycopg2'"
+      changed_when: false
+      failed_when: false
+      register: pg_diag_psycopg2_check
+
+    - name: Fail when psycopg2 is missing
+      when: pg_diag_psycopg2_check.rc != 0
+      ansible.builtin.fail:
+        msg: >-
+          psycopg2 is not installed for {{ ansible_python_interpreter }}.
+          Install with: {{ ansible_python_interpreter }} -m pip install psycopg2-binary
+          (or the distro package for that interpreter, e.g. python3-psycopg2 on Fedora).
+
+    - name: Test PostgreSQL login
+      community.postgresql.postgresql_query:
+        login_host: "{{ pg_login_host }}"
+        login_port: "{{ pg_login_port | default(5432) }}"
+        login_user: "{{ pg_login_user }}"
+        login_password: "{{ pg_login_password | default(omit) }}"
+        login_db: "{{ pg_login_db }}"
+        ssl_mode: "{{ pg_ssl_mode | default('prefer') }}"
+        query: "SELECT current_database() AS db"
+      register: pg_diag_connect_test
+
+    - name: Fail with PostgreSQL connection error
+      when: pg_diag_connect_test is failed
+      ansible.builtin.fail:
+        msg: >-
+          Cannot connect to {{ pg_login_db }}@{{ pg_login_host }}:{{ pg_login_port | default(5432) }}
+          as {{ pg_login_user }}: {{ pg_diag_connect_test.msg }}.
+          If the database does not exist, set pg_login_db to the AAP controller
+          database (often awx) or list databases with psql -h ... -U postgres -d postgres -c '\l'.
+
+    - name: Query current database size
+      community.postgresql.postgresql_query:
+        login_host: "{{ pg_login_host }}"
+        login_port: "{{ pg_login_port | default(5432) }}"
+        login_user: "{{ pg_login_user }}"
+        login_password: "{{ pg_login_password | default(omit) }}"
+        login_db: "{{ pg_login_db }}"
+        ssl_mode: "{{ pg_ssl_mode | default('prefer') }}"
+        query: "{{ lookup('file', 'files/queries/database_size.sql') }}"
+      register: pg_diag_database_size
+      no_log: true
+
+    - name: Query on-disk size breakdown for target table
+      community.postgresql.postgresql_query:
+        login_host: "{{ pg_login_host }}"
+        login_port: "{{ pg_login_port | default(5432) }}"
+        login_user: "{{ pg_login_user }}"
+        login_password: "{{ pg_login_password | default(omit) }}"
+        login_db: "{{ pg_login_db }}"
+        ssl_mode: "{{ pg_ssl_mode | default('prefer') }}"
+        query: "{{ lookup('file', 'files/queries/table_size.sql') }}"
+        named_args: "{{ pg_query_named_args }}"
+      register: pg_diag_table_size
+      no_log: true
+
+    - name: Query live/dead tuple and vacuum timestamps for target table
+      community.postgresql.postgresql_query:
+        login_host: "{{ pg_login_host }}"
+        login_port: "{{ pg_login_port | default(5432) }}"
+        login_user: "{{ pg_login_user }}"
+        login_password: "{{ pg_login_password | default(omit) }}"
+        login_db: "{{ pg_login_db }}"
+        ssl_mode: "{{ pg_ssl_mode | default('prefer') }}"
+        query: "{{ lookup('file', 'files/queries/vacuum_stats.sql') }}"
+        named_args: "{{ pg_query_named_args }}"
+      register: pg_diag_vacuum_stats
+      no_log: true
+
+    - name: Query TOAST companion table stats for target table
+      community.postgresql.postgresql_query:
+        login_host: "{{ pg_login_host }}"
+        login_port: "{{ pg_login_port | default(5432) }}"
+        login_user: "{{ pg_login_user }}"
+        login_password: "{{ pg_login_password | default(omit) }}"
+        login_db: "{{ pg_login_db }}"
+        ssl_mode: "{{ pg_ssl_mode | default('prefer') }}"
+        query: "{{ lookup('file', 'files/queries/toast_stats.sql') }}"
+        named_args: "{{ pg_query_named_args }}"
+      register: pg_diag_toast_stats
+      no_log: true
+
+    - name: Normalize query rows for reporting
+      ansible.builtin.set_fact:
+        pg_diag_db: "{{ pg_diag_database_size.query_result[0] }}"
+        pg_diag_table: "{{ pg_diag_table_size.query_result | first | default({}) }}"
+        pg_diag_vacuum: "{{ pg_diag_vacuum_stats.query_result | first | default({}) }}"
+        pg_diag_toast_rows: "{{ pg_diag_toast_stats.query_result | default([]) }}"
+
+    - name: Assert target table exists in pg_class
+      ansible.builtin.assert:
+        that:
+          - pg_diag_table.table_name is defined
+        fail_msg: >-
+          Table '{{ pg_target_table }}' was not found in pg_class on
+          {{ pg_login_db }}@{{ pg_login_host }}.
+
+    - name: Assert target table has pg_stat_user_tables entry
+      ansible.builtin.assert:
+        that:
+          - pg_diag_vacuum.relname is defined
+        fail_msg: >-
+          Table '{{ pg_target_table }}' has no row in pg_stat_user_tables
+          (wrong schema, system catalog, or stats not yet collected).
+
+    - name: Ensure report output directory exists
+      ansible.builtin.file:
+        path: "{{ pg_report_path | dirname }}"
+        state: directory
+        mode: "0755"
+
+    - name: Write diagnostic report
+      ansible.builtin.template:
+        src: report.md.j2
+        dest: "{{ pg_report_path }}"
+        mode: "0644"
+
+    - name: Display report path
+      ansible.builtin.debug:
+        msg: "Wrote {{ pg_report_path }}"
+
+    - name: Display report contents
+      when: pg_report_display | default(true) | bool
+      ansible.builtin.command:
+        cmd: cat "{{ pg_report_path }}"
+      register: pg_diag_report_cat
+      changed_when: false
+
+    - name: Show report
+      when: pg_report_display | default(true) | bool
+      ansible.builtin.debug:
+        msg: "{{ pg_diag_report_cat.stdout_lines }}"

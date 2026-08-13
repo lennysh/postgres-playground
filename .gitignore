@@ -1,0 +1,6 @@
+.ansible/
+**/vars/*.yml
+!**/vars/pg_connect.example.yml
+**/reports/
+**/*-report.md
+**/ansible-verbose.log
