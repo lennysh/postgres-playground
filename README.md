@@ -2,8 +2,6 @@
 
 Lab and demo content for PostgreSQL operations: diagnostics, maintenance, and Ansible automation.
 
-Companion to [ansible-playground](https://github.com/lennysh/ansible-playground) (AAP job templates and broader automation demos).
-
 ## Demos
 
 | Demo | Path | What it shows |
@@ -19,3 +17,8 @@ pip install -r requirements.txt
 cp vars/pg_connect.example.yml vars/pg_connect.yml   # edit credentials
 ansible-playbook playbook.yml -e @vars/pg_connect.yml
 ```
+
+## Related repos
+
+- [cheat-sheets](https://github.com/lennysh/cheat-sheets) — copy-paste notes (AAP, Automation Orchestrator, OpenShift, …)
+- [ansible-playground](https://github.com/lennysh/ansible-playground) — playbooks and AAP Config-as-Code
